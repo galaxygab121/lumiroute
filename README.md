@@ -114,7 +114,7 @@ Training:
 
 ---
 
-## 🛠 Tech Stack
+##  Tech Stack
 
 Frontend:
 - Next.js
@@ -140,7 +140,7 @@ Backend:
 
 ---
 
-## 📌 Why Lumiroute?
+##  Why Lumiroute?
 
 Traditional navigation optimizes for time.  
 Lumiroute optimizes for personal safety.
