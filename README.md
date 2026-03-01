@@ -114,14 +114,6 @@ Training:
 
 ---
 
-## Demo
-
-![Screenshot](docs/picture-1.png)
-![Screenshot](docs/picture-2.png)
-![Screenshot](docs/picture-3.png)
-![Screenshot](docs/picture-4.png)
-![Screenshot](docs/picture-5.png)
-
 ## 🛠 Tech Stack
 
 Frontend:
