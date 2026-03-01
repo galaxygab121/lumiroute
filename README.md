@@ -10,9 +10,19 @@
 Modern navigation systems optimize for **time** and **traffic**.  
 LumiRoute introduces a second optimization objective:
 
-$begin:math:display$
-\\text\{Minimize Travel Time\} \+ \\text\{Minimize Contextual Safety Risk\}
-$end:math:display$
+## Optimization Objective
+
+Score = α · Travel Time + β · Contextual Safety Risk
+
+Where:
+
+- α = time weighting parameter  
+- β = safety weighting parameter  
+- Travel Time = estimated route duration (seconds)  
+- Contextual Safety Risk = computed environmental exposure score  
+
+This allows dynamic balancing between efficiency and safety.
+
 
 By integrating historical crime density with spatial filtering and adaptive scoring, LumiRoute transforms route selection into a multi-objective decision system.
 
@@ -140,37 +150,35 @@ Shareable Tracking View
 
 ## 1. Bounding Box Filtering
 
-To improve efficiency, crime data is restricted to the spatial envelope surrounding a route:
+To improve performance, crime events are filtered spatially using the route’s bounding box.
 
-$begin:math:display$
-\\text\{Filtered Crimes\} \= \\\{ c \\mid c \\in \\text\{BoundingBox\(route\)\} \\\}
-$end:math:display$
+Filtered Crimes = { c ∈ Dataset | c ∈ BoundingBox(route) }
 
-This reduces complexity from scanning the entire dataset to evaluating only spatially relevant points.
+This reduces computational complexity from scanning the entire dataset to evaluating only geographically relevant events.
+
 
 ---
 
 ## 2. Segment-Level Risk Scoring
 
-Routes are discretized into coordinate segments.
+Each route is discretized into coordinate segments.
 
-For each segment:
+For each segment sᵢ:
 
-$begin:math:display$
-\\text\{Risk\}\(s\_i\) \= \\sum\_\{j\=1\}\^\{n\} w\_j \\cdot f\(d\_\{ij\}\)
-$end:math:display$
+Risk(sᵢ) = Σ [ wⱼ · f(dᵢⱼ) ]
 
 Where:
 
-- $begin:math:text$ d\_\{ij\} $end:math:text$ = distance from segment $begin:math:text$ s\_i $end:math:text$ to crime event $begin:math:text$ j $end:math:text$
-- $begin:math:text$ f\(\\cdot\) $end:math:text$ = inverse-distance decay function
-- $begin:math:text$ w\_j $end:math:text$ = severity weight for crime type
+- dᵢⱼ = distance between segment sᵢ and crime event j  
+- f(d) = inverse-distance decay function  
+- wⱼ = severity weight of crime type j  
 
 Total route risk:
 
-$begin:math:display$
-\\text\{Route Risk\} \= \\sum\_\{i\=1\}\^\{k\} \\text\{Risk\}\(s\_i\)
-$end:math:display$
+Route Risk = Σ Risk(sᵢ)
+
+This creates a continuous spatial risk accumulation model.
+
 
 ---
 
@@ -188,16 +196,23 @@ Transit modeling increases weighting near station clusters due to higher observe
 
 ## 4. Multi-Objective Optimization
 
-Final ranking balances time and safety:
+Final ranking formula:
 
-$begin:math:display$
-\\text\{Score\} \= \\alpha \(\\text\{Time\}\) \+ \\beta \(\\text\{Risk\}\)
-$end:math:display$
+Final Score = α · Time + β · Adjusted Risk
 
-Where:
+Routes are sorted ascending by Final Score.
 
-- $begin:math:text$ \\alpha $end:math:text$ = time weighting
-- $begin:math:text$ \\beta $end:math:text$ = safety weighting
+---
+
+## Computational Characteristics
+
+Time Complexity (naive):  
+O(N_crimes × N_segments)
+
+Time Complexity (with bounding box filtering):  
+O(N_filtered × N_segments)
+
+Bounding box filtering significantly reduces N_filtered relative to N_crimes.
 
 ---
 
