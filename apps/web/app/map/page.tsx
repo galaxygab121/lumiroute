@@ -577,7 +577,7 @@ function HeatLayer({ points, baseRadiusM = 140 }: { points: HeatPoint[]; baseRad
 export default function MapPage() {
   // Env
   const googleKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
-  const mapId = process.env.NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID ?? ""; // optional (removes “invalid Map ID” warning)
+  const mapId = process.env.NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID ?? ""; 
   const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
   // Map click selection

@@ -167,7 +167,7 @@ export default function ShareWalkPage() {
               <GMap
                 center={center}
                 zoom={14}
-                mapId={process.env.NEXT_PUBLIC_GOOGLE_MAP_ID}
+                mapId={process.env.NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID}
                 gestureHandling="greedy"
                 disableDefaultUI={false}
               >
