@@ -16,11 +16,17 @@ import {
  */
 type LatLng = google.maps.LatLngLiteral;
 
+type RouteMeta = {
+  samplepoints?: LatLng[];
+  transitstops?: LatLng[];
+};
+
 type RouteAlt = {
   id: number;
   path: LatLng[];
   etaMin: number;
   distMi: number;
+  meta?: RouteMeta;
 };
 
 type ScoredRouteDetails = {
@@ -191,7 +197,8 @@ function secondsToMinutes(s: number) {
 
 // risk -> safety score (0–100)
 function riskToSafety(risk: number): number {
-  const safety = 100 * Math.exp(-risk / 5);
+  const SCALE = 75; // try 50–150 depending on your risk magnitudes
+  const safety = 100 * Math.exp(-risk / SCALE);
   return Math.max(0, Math.min(100, Math.round(safety)));
 }
 
@@ -371,6 +378,36 @@ function offsetPath(path: LatLng[], dLat: number, dLng: number) {
   return path.map((p) => ({ lat: p.lat + dLat, lng: p.lng + dLng }));
 }
 
+function samplePath(path: LatLng[], everyN: number) {
+  if (path.length <= everyN) return path;
+  const out: LatLng[] = [];
+  for (let i = 0; i < path.length; i += everyN) out.push(path[i]);
+  // ensure last point included
+  if (out[out.length - 1] !== path[path.length - 1]) out.push(path[path.length - 1]);
+  return out;
+}
+
+function extractTransitStops(route: google.maps.DirectionsRoute): LatLng[] {
+  const leg = route.legs?.[0];
+  if (!leg?.steps) return [];
+
+  const stops: LatLng[] = [];
+  for (const step of leg.steps) {
+    // In Google Directions, transit steps have transit_details
+    const t = (step as google.maps.DirectionsStep).transit;
+    if (!t) continue;
+
+    const dep = t.departure_stop?.location;
+    const arr = t.arrival_stop?.location;
+    if (dep?.lat && dep?.lng) stops.push({ lat: dep.lat(), lng: dep.lng() });
+    if (arr?.lat && arr?.lng) stops.push({ lat: arr.lat(), lng: arr.lng() });
+  }
+
+  // de-dupe
+  const key = (p: LatLng) => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`;
+  return Array.from(new Map(stops.map((s) => [key(s), s])).values());
+}
+
 
 
 
@@ -388,6 +425,7 @@ function RouteLine({
   weight = 6,
   opacity = 0.9,
   dashed = false,
+  animateMs = 450,
 }: {
   path: LatLng[];
   color: string;
@@ -395,26 +433,38 @@ function RouteLine({
   weight?: number;
   opacity?: number;
   dashed?: boolean;
+  animateMs?: number;
 }) {
   const map = useMap();
-  const lineRef = useRef<google.maps.Polyline | null>(null);
+  const currentRef = useRef<google.maps.Polyline | null>(null);
+  const prevRef = useRef<google.maps.Polyline | null>(null);
+  const rafRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!map) return;
 
-    // cleanup old
-    if (lineRef.current) {
-      lineRef.current.setMap(null);
-      lineRef.current = null;
+    // Move current -> prev (so we can fade it out)
+    if (currentRef.current) {
+      if (prevRef.current) prevRef.current.setMap(null);
+      prevRef.current = currentRef.current;
+      prevRef.current.setOptions({ zIndex: zIndex - 1 });
+      currentRef.current = null;
     }
 
-    if (!path.length) return;
+    // If no path, just clear
+    if (!path.length) {
+      if (prevRef.current) {
+        prevRef.current.setMap(null);
+        prevRef.current = null;
+      }
+      return;
+    }
 
-    const line = new google.maps.Polyline({
+    const baseOptions: google.maps.PolylineOptions = {
       path,
       geodesic: true,
       strokeColor: color,
-      strokeOpacity: opacity,
+      strokeOpacity: 0,
       strokeWeight: weight,
       zIndex,
       ...(dashed
@@ -428,16 +478,53 @@ function RouteLine({
             ],
           }
         : {}),
-    });
+    };
 
+    const line = new google.maps.Polyline(baseOptions);
     line.setMap(map);
-    lineRef.current = line;
+    currentRef.current = line;
+
+    // Animate crossfade
+    const start = performance.now();
+
+    const tick = (t: number) => {
+      const p = Math.min(1, (t - start) / animateMs);
+
+      // fade in current
+      if (currentRef.current) currentRef.current.setOptions({ strokeOpacity: opacity * p });
+
+      // fade out previous
+      if (prevRef.current) prevRef.current.setOptions({ strokeOpacity: opacity * (1 - p) });
+
+      if (p < 1) {
+        rafRef.current = requestAnimationFrame(tick);
+      } else {
+        // remove previous once animation completes
+        if (prevRef.current) {
+          prevRef.current.setMap(null);
+          prevRef.current = null;
+        }
+        rafRef.current = null;
+      }
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
 
     return () => {
-      line.setMap(null);
-      lineRef.current = null;
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
     };
-  }, [map, path, color, zIndex, weight, opacity, dashed]);
+  }, [map, path, color, zIndex, weight, opacity, dashed, animateMs]);
+
+  // cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (currentRef.current) currentRef.current.setMap(null);
+      if (prevRef.current) prevRef.current.setMap(null);
+      currentRef.current = null;
+      prevRef.current = null;
+    };
+  }, []);
 
   return null;
 }
@@ -541,6 +628,10 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
   const [weightAssault, setWeightAssault] = useState(2);
   const [weightBattery, setWeightBattery] = useState(2);
   const [weightCsa, setWeightCsa] = useState(5);
+
+  // Agent route choice (experimental)
+  type TravelMode = "WALKING" | "TRANSIT" | "DRIVING" | "BICYCLING";
+  const [travelMode, setTravelMode] = useState<TravelMode>("WALKING");
 
 
   // Heat overlay
@@ -1068,21 +1159,39 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
         const service = new google.maps.DirectionsService();
         const viaPts = buildViaCandidates(startLL, endLL);
 
-        const requests: google.maps.DirectionsRequest[] = [
-          {
-            origin: startLL,
-            destination: endLL,
-            travelMode: google.maps.TravelMode.WALKING,
-            provideRouteAlternatives: true,
+        const mode = google.maps.TravelMode[travelMode];
+
+const requests: google.maps.DirectionsRequest[] =
+  mode === google.maps.TravelMode.TRANSIT
+    ? [
+        {
+          origin: startLL,
+          destination: endLL,
+          travelMode: mode,
+          provideRouteAlternatives: true,
+          transitOptions: {
+            departureTime: new Date(),
           },
-          ...viaPts.map((via) => ({
-            origin: startLL,
-            destination: endLL,
-            travelMode: google.maps.TravelMode.WALKING,
-            provideRouteAlternatives: false,
-            waypoints: [{ location: via, stopover: false }],
-          })),
-        ];
+        },
+      ]
+    : [
+        {
+          origin: startLL,
+          destination: endLL,
+          travelMode: mode,
+          provideRouteAlternatives: true,
+        },
+        ...viaPts.map((via) => ({
+          origin: startLL,
+          destination: endLL,
+          travelMode: mode,
+          provideRouteAlternatives: false,
+          waypoints: [{ location: via, stopover: false }],
+        })),
+      ];
+
+
+
 
         const allGoogleRoutes: google.maps.DirectionsRoute[] = [];
 
@@ -1121,13 +1230,33 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
           if (seen.has(sig)) return;
           seen.add(sig);
 
+          const sample_points = samplePath(path, 12); // tune: smaller = more precise, bigger = faster
+          const transit_stops =
+            travelMode === "TRANSIT" ? extractTransitStops(r) : [];
+
+          const transitStops: LatLng[] = [];
+
+          if (travelMode === "TRANSIT") {
+            const leg = r.legs?.[0];
+            const steps = leg?.steps ?? [];
+            for (const s of steps) {
+              const t = (s as google.maps.DirectionsStep).transit;
+              const dep = t?.departure_stop?.location;
+              const arr = t?.arrival_stop?.location;
+
+              if (dep?.lat && dep?.lng) transitStops.push({ lat: dep.lat(), lng: dep.lng() });
+              if (arr?.lat && arr?.lng) transitStops.push({ lat: arr.lat(), lng: arr.lng() });
+            }
+          }
+
           routes.push({
             id: routes.length,
             path,
             etaMin: secondsToMinutes(durationSec),
             distMi: Number(metersToMiles(distanceM).toFixed(2)),
+            meta: transitStops.length ? { transitstops: transitStops } : undefined,
           });
-        });
+          });
 
         if (!routes.length) {
           throw new Error("No decodable routes returned by Google.");
@@ -1145,19 +1274,28 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            datetime_iso: new Date().toISOString(),
-            routes: routes.map((r) => ({ id: r.id, path: r.path })),
-            preferences: {
-              radius_km: radiusKm,
-              window_days: windowDays,
-              weights: {
-                ROBBERY: weightRobbery,
-                ASSAULT: weightAssault,
-                BATTERY: weightBattery,
-                "CRIMINAL SEXUAL ASSAULT": weightCsa,
-              },
+          datetime_iso: new Date().toISOString(),
+          routes: routes.map((r) => ({
+            id: r.id,
+            path: r.path,
+            meta: r.meta?.transitstops
+              ? { transitstops: r.meta.transitstops }
+              : undefined,
+          })),
+          preferences: {
+            radius_km: radiusKm,
+            window_days: windowDays,
+            weights: {
+              ROBBERY: weightRobbery,
+              ASSAULT: weightAssault,
+              BATTERY: weightBattery,
+              "CRIMINAL SEXUAL ASSAULT": weightCsa,
             },
-          }),
+          },
+          context: {
+            travel_mode: travelMode,
+          },
+        }),
         });
 
         if (!scoreRes.ok) {
@@ -1179,22 +1317,28 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            datetime_iso: new Date().toISOString(),
-            routes: routes.map((r) => ({ id: r.id, path: r.path })),
-            preferences: {
-              radius_km: radiusKm,
-              window_days: windowDays,
-              weights: {
-                ROBBERY: weightRobbery,
-                ASSAULT: weightAssault,
-                BATTERY: weightBattery,
-                "CRIMINAL SEXUAL ASSAULT": weightCsa,
-              },
+          datetime_iso: new Date().toISOString(),
+          routes: routes.map((r) => ({
+            id: r.id,
+            path: r.path,
+            meta: r.meta?.transitstops
+              ? { transitstops: r.meta.transitstops }
+              : undefined,
+          })),
+          preferences: {
+            radius_km: radiusKm,
+            window_days: windowDays,
+            weights: {
+              ROBBERY: weightRobbery,
+              ASSAULT: weightAssault,
+              BATTERY: weightBattery,
+              "CRIMINAL SEXUAL ASSAULT": weightCsa,
             },
-            context: {
-              travel_mode: "WALKING",
-            },
-          }),
+          },
+          context: {
+            travel_mode: travelMode,
+          },
+        }),
         });
 
         if (!agentRes.ok) {
@@ -1214,17 +1358,17 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
         if (chosenPred == null || preds.length < 2) {
           setAgentConfidence(null);
         } else {
-          const sorted = [...preds].sort((a, b) => a.pred_risk - b.pred_risk); // lower risk = safer
+          const sorted = [...preds].sort((a, b) => a.pred_risk - b.pred_risk);
           const best = sorted[0];
           const second = sorted[1];
 
-          // If chosen is best, margin = second-best - chosen. If not best, margin is negative.
-          const margin =
-            best.id === chosenId ? (second.pred_risk - chosenPred) : (best.pred_risk - chosenPred);
+          const gap = second.pred_risk - best.pred_risk;          // how separated top 2 are
+          const scale = Math.max(0.001, best.pred_risk);          // avoid divide-by-zero
+          const gapPct = gap / scale;                             // relative separation
 
-          // Convert margin to 0..100 with a smooth curve (tweak 0.15 if needed)
-          const conf = 1 / (1 + Math.exp(-margin / 0.15));
-          setAgentConfidence(Math.round(conf * 100));
+          // Map: 0% gap => 50%, 20% gap => 90% (tweak)
+          const conf = 50 + Math.min(40, gapPct * 200);           // 0.2 * 200 = 40
+          setAgentConfidence(Math.round(conf));
         }
 
         // Save agent predictions (optional)
@@ -1305,32 +1449,34 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
         setSafeReason((agentData.explanation || "") + complianceAddOn);
 
         if (!cancelled) setLoading(false);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Unknown error";
-        if (!cancelled) {
-          setErrorMsg(msg);
-          setLoading(false);
-        }
-      }
-    }
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : "Unknown error";
+                if (!cancelled) {
+                  setErrorMsg(msg);
+                  setLoading(false);
+                }
+              }
+            }
+            run();
 
-    run();
+            return () => {
+              cancelled = true;
+            };
+          }, [
+            start,
+            end,
+            apiBase,
+            googleKey,
+            radiusKm,
+            windowDays,
+            weightRobbery,
+            weightAssault,
+            weightBattery,
+            weightCsa,
+            travelMode,
+          ]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    start,
-    end,
-    apiBase,
-    googleKey,
-    radiusKm,
-    windowDays,
-    weightRobbery,
-    weightAssault,
-    weightBattery,
-    weightCsa,
-  ]);
+
 
   /**
    * -----------------------
@@ -1385,39 +1531,125 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
     };
   }, [start, end, apiBase, windowDays]);
 
-  /**
-   * -----------------------
-   * Render
-   * -----------------------
-   */
-  return (
+ /**
+ * -----------------------
+ * Render
+ * -----------------------
+ */
+return (
+  <div className="min-h-screen bg-gradient-to-br from-pink-50 via-violet-50 to-sky-50">
     <div className="mx-auto max-w-5xl p-6">
-      <h1 className="text-2xl font-semibold">Lumiroute</h1>
-      <p className="mt-1 text-sm text-gray-600">
-        Click once to set <b>Start</b>, click again to set <b>Destination</b>. Click a third time to
-        start over.
-      </p>
+      {/* Header (Municipal portal style) */}
+      <div className="mb-6 rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-sm backdrop-blur">
+        <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+          <div>
+            <div className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-semibold tracking-wide text-slate-700">
+              CITY DASHBOARD • PEDESTRIAN ROUTING
+            </div>
 
-      {/* Preferences */}
-      <div className="mt-4 rounded-2xl border p-4">
+            <h1 className="mt-3 text-4xl font-semibold tracking-tight text-slate-950">
+              <span className="bg-gradient-to-r from-slate-900 via-violet-700 to-sky-600 bg-clip-text text-transparent">
+                LUMIROUTE
+              </span>
+            </h1>
+
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-700">
+              Select a start and destination point to compare walking routes using incident-aware scoring and a
+              learning-based recommendation model.
+            </p>
+          </div>
+
+          <div className="flex gap-3">
+            <button
+              onClick={resetAll}
+              className="rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-900 shadow-sm hover:bg-slate-50"
+            >
+              Reset
+            </button>
+          </div>
+        </div>
+
+        {/* Quick metrics strip */}
+        <div className="mt-5 grid grid-cols-1 gap-3 md:grid-cols-4">
+          <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+            <p className="text-[11px] font-semibold tracking-wide text-slate-500">MODE</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{{
+              WALKING: "Walking",
+              TRANSIT: "Transit",
+              DRIVING: "Driving",
+              BICYCLING: "Bicycling",
+            }[travelMode] ?? travelMode}
+            </p>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+            <p className="text-[11px] font-semibold tracking-wide text-slate-500">WINDOW</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{windowDays} days</p>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+            <p className="text-[11px] font-semibold tracking-wide text-slate-500">RADIUS</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">{Math.round(radiusKm * 1000)}m</p>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3">
+            <p className="text-[11px] font-semibold tracking-wide text-slate-500">MODEL CONFIDENCE</p>
+            <p className="mt-1 text-sm font-semibold text-slate-900">
+              {agentConfidence === null ? "—" : `${agentConfidence}%`}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Safety Preferences */}
+      <div className="rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-sm backdrop-blur">
         <div className="flex items-center justify-between gap-3">
-          <h3 className="font-semibold">Safety Preferences</h3>
+          <h2 className="text-base font-semibold text-black">Safety Preferences</h2>
 
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-sm text-black">
             <input
               type="checkbox"
               checked={showHeat}
               onChange={(e) => setShowHeat(e.target.checked)}
+              className="h-4 w-4 accent-violet-600"
             />
             Show heat overlay
           </label>
         </div>
 
-        <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-3">
+        {/* Travel Mode */}
+<div className="mb-6">
+  <label className="block text-sm font-medium text-black">Travel mode</label>
+
+  <div className="mt-2 flex flex-wrap gap-2">
+    {[
+      { label: "Walking", value: "WALKING" },
+      { label: "Transit", value: "TRANSIT" },
+      { label: "Driving", value: "DRIVING" },
+      { label: "Bicycling", value: "BICYCLING" },
+    ].map((mode) => (
+      <button
+        key={mode.value}
+        type="button"
+        onClick={() => setTravelMode(mode.value as TravelMode)}
+        className={`rounded-2xl border px-4 py-2 text-sm font-semibold transition ${
+          travelMode === mode.value
+            ? "border-violet-300 bg-violet-100 text-violet-800"
+            : "border-slate-200 bg-white text-black hover:bg-slate-50"
+        }`}
+      >
+        {mode.label}
+      </button>
+    ))}
+  </div>
+</div>
+
+        <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-3">
+          {/* Radius */}
           <div>
-            <label className="text-sm font-medium">Radius</label>
+            <label className="block text-sm font-medium text-black">Radius</label>
             <select
-              className="mt-1 w-full rounded-xl border px-3 py-2 text-sm"
+              className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
               value={radiusKm}
               onChange={(e) => setRadiusKm(Number(e.target.value))}
             >
@@ -1427,10 +1659,11 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
             </select>
           </div>
 
+          {/* Time Window */}
           <div>
-            <label className="text-sm font-medium">Time window</label>
+            <label className="block text-sm font-medium text-black">Time window</label>
             <select
-              className="mt-1 w-full rounded-xl border px-3 py-2 text-sm"
+              className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
               value={windowDays}
               onChange={(e) => setWindowDays(Number(e.target.value))}
             >
@@ -1440,69 +1673,87 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
             </select>
           </div>
 
+          {/* Category Weights */}
           <div>
-            <label className="text-sm font-medium">Category emphasis</label>
-            <div className="mt-2 space-y-2 text-sm">
-              <div className="flex items-center justify-between">
-                <span>Robbery</span>
+            <label className="block text-sm font-medium text-black">Category weights</label>
+
+            <div className="mt-3 space-y-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-black">Robbery</span>
                 <input
-                  className="w-20 rounded-lg border px-2 py-1"
                   type="number"
                   min={0}
                   max={10}
                   value={weightRobbery}
                   onChange={(e) => setWeightRobbery(Number(e.target.value))}
+                  className="w-24 rounded-2xl border border-slate-200 bg-white px-2 py-1 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
                 />
               </div>
 
-              <div className="flex items-center justify-between">
-                <span>Assault</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-black">Assault</span>
                 <input
-                  className="w-20 rounded-lg border px-2 py-1"
                   type="number"
                   min={0}
                   max={10}
                   value={weightAssault}
                   onChange={(e) => setWeightAssault(Number(e.target.value))}
+                  className="w-24 rounded-2xl border border-slate-200 bg-white px-2 py-1 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
                 />
               </div>
 
-              <div className="flex items-center justify-between">
-                <span>Battery</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-black">Battery</span>
                 <input
-                  className="w-20 rounded-lg border px-2 py-1"
                   type="number"
                   min={0}
                   max={10}
                   value={weightBattery}
                   onChange={(e) => setWeightBattery(Number(e.target.value))}
+                  className="w-24 rounded-2xl border border-slate-200 bg-white px-2 py-1 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
                 />
               </div>
 
-              <div className="flex items-center justify-between">
-                <span>Criminal Sexual Assault</span>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-black">Criminal Sexual Assault</span>
                 <input
-                  className="w-20 rounded-lg border px-2 py-1"
                   type="number"
                   min={0}
                   max={10}
                   value={weightCsa}
                   onChange={(e) => setWeightCsa(Number(e.target.value))}
+                  className="w-24 rounded-2xl border border-slate-200 bg-white px-2 py-1 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
                 />
               </div>
             </div>
           </div>
         </div>
 
-        <p className="mt-3 text-xs text-gray-500">
-          Higher numbers make Lumiroute avoid that category more aggressively.
+        <p className="mt-5 text-xs text-slate-600">
+          Higher values increase how strongly routes avoid incidents in that category.
         </p>
       </div>
 
       {/* Map */}
-      <div className="mt-4 overflow-hidden rounded-2xl border">
+      <div className="mt-4 overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
         <APIProvider apiKey={googleKey} libraries={["places"]}>
-          <div className="h-[520px] w-full">
+          <div className="relative h-[580px] w-full">
+            {/* Route Legend (portal style) */}
+            <div className="absolute left-4 top-4 z-50 rounded-2xl border border-slate-200 bg-white/90 p-3 text-xs text-slate-800 shadow-sm backdrop-blur">
+              <div className="flex items-center gap-2">
+                <span className="h-3 w-3 rounded-full bg-blue-600" />
+                Fastest
+              </div>
+              <div className="mt-1 flex items-center gap-2">
+                <span className="h-3 w-3 rounded-full bg-green-600" />
+                Safer
+              </div>
+              <div className="mt-1 flex items-center gap-2">
+                <span className="h-3 w-3 rounded-full bg-purple-500" />
+                Safe place
+              </div>
+            </div>
+
             <GMap
               defaultCenter={center}
               defaultZoom={12}
@@ -1514,7 +1765,7 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
               {start && <Marker position={start} />}
               {end && <Marker position={end} />}
 
-              {/* Floating blue "You" dot */}
+              {/* Floating "You" dot */}
               {currentPos && liveActive && (
                 <Marker
                   position={currentPos}
@@ -1535,21 +1786,22 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
 
               {/* Routes */}
               {fastPath.length > 0 && (
-                  <RouteLine path={fastPath} color="#2563eb" dashed zIndex={10} weight={5} opacity={0.95} />
+                <RouteLine path={fastPath} color="#2563eb" dashed zIndex={10} weight={5} opacity={0.95} />
               )}
+
               {safePath.length > 0 && (
-                  <RouteLine path={safePath} color="#16a34a" zIndex={20} weight={7} opacity={0.95} />
+                <RouteLine path={safePath} color="#16a34a" zIndex={20} weight={7} opacity={0.95} />
               )}
 
               {safePlacePath.length > 0 && (
-                  <RouteLine path={safePlacePath} color="#a855f7" zIndex={30} weight={7} opacity={0.95} />
+                <RouteLine path={safePlacePath} color="#a855f7" zIndex={30} weight={7} opacity={0.95} />
               )}
+
               <NearestSafePlaceController
                 location={searchAround}
-                category={safePlaceCategory} 
+                category={safePlaceCategory}
                 exposeFindFn={(fn) => {
                   findSafePlaceRef.current = () => {
-                    // wrap so we can stop loading when results arrive
                     fn?.();
                   };
                 }}
@@ -1564,122 +1816,78 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
                 }}
               />
 
-              {safePlace && (
-                <Marker
-                  position={safePlace.location}
-                  title={safePlace.name}
-                  zIndex={9998}
-                />
-              )}
+              {safePlace && <Marker position={safePlace.location} title={safePlace.name} zIndex={9998} />}
             </GMap>
           </div>
         </APIProvider>
       </div>
 
-      {/* Live Walk Mode */}
-      <div className="mt-4 rounded-2xl border p-4">
-        <div className="flex items-center justify-between gap-3">
+      {/* Live Walk Mode (portal standard) */}
+      <div className="mt-4 rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-sm backdrop-blur">
+        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div className="flex items-center gap-3">
-            <h3 className="font-semibold">Live Walk Mode</h3>
-            <div className={`rounded-full border px-3 py-1 text-xs font-semibold ${liveStatus.cls}`}>
+            <h2 className="text-base font-semibold text-black">Live Walk Mode</h2>
+            <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${liveStatus.cls}`}>
               {liveStatus.label}
-            </div>
+            </span>
           </div>
 
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-sm text-black">
             <input
               type="checkbox"
               checked={demoMode}
               onChange={(e) => setDemoMode(e.target.checked)}
+              className="h-4 w-4 accent-violet-600"
             />
             Demo mode
           </label>
         </div>
 
-        <div>
-          <label className="text-sm font-medium">Safe place type</label>
-          <select
-            className="mt-1 w-full rounded-xl border px-3 py-2 text-sm"
-            value={safePlaceCategory}
-            onChange={(e) => setSafePlaceCategory(e.target.value as SafePlaceCategory)}
-          >
-            <option value="24hr_store">24hr store</option>
-            <option value="police">Police station</option>
-            <option value="hospital">Hospital</option>
-          </select>
-        </div>
-
-        <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
-          <button
-            type="button"
-            onClick={triggerFindSafePlace}
-            className="rounded-xl border px-3 py-2 text-sm font-semibold hover:bg-gray-50 disabled:opacity-50"
-            disabled={findingSafePlace}
-          >
-            {findingSafePlace ? "Searching…" : "Find nearest open safe place"}
-          </button>
-        </div>
-
-        {safePlaceErr ? (
-          <p className="mt-2 text-sm text-red-600">{safePlaceErr}</p>
-        ) : null}
-
-        {safePlace ? (
-          <div className="mt-3 rounded-2xl border bg-white p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-sm font-semibold">{safePlace.name}</p>
-                {safePlace.address ? <p className="mt-1 text-xs text-gray-600">{safePlace.address}</p> : null}
-                {safePlace.rating ? (
-                  <p className="mt-1 text-xs text-gray-600">
-                    Rating: {safePlace.rating} {safePlace.userRatingsTotal ? `(${safePlace.userRatingsTotal})` : ""}
-                  </p>
-                ) : null}
-              </div>
-
-              <a
-                className="rounded-xl bg-black px-3 py-2 text-xs font-semibold text-white hover:bg-gray-800"
-                href={`https://www.google.com/maps/dir/?api=1&destination_place_id=${encodeURIComponent(
-                  safePlace.placeId
-                )}&travelmode=walking`}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Directions
-              </a>
-            </div>
-          </div>
-        ) : null}
-
-        {shareToken ? (
-          <div className="mt-2 text-sm">
-            <span className="text-gray-600">Share link: </span>
-            <a
-              className="font-semibold underline"
-              href={`/share/${encodeURIComponent(shareToken)}`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              Open live safety view
-            </a>
-          </div>
-        ) : null}
-
-        <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+        <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-3">
+          {/* Safe place type */}
           <div>
-            <label className="text-sm font-medium">Trusted email</label>
+            <label className="block text-sm font-medium text-black">Safe place type</label>
+            <select
+              className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
+              value={safePlaceCategory}
+              onChange={(e) => setSafePlaceCategory(e.target.value as SafePlaceCategory)}
+            >
+              <option value="24hr_store">24hr store</option>
+              <option value="police">Police station</option>
+              <option value="hospital">Hospital</option>
+            </select>
+
+            <button
+              type="button"
+              onClick={triggerFindSafePlace}
+              disabled={findingSafePlace}
+              className="mt-3 inline-flex w-full items-center justify-center rounded-2xl border border-slate-200 bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-slate-800 disabled:opacity-50"
+            >
+              {findingSafePlace ? "Searching…" : "Find nearest open safe place"}
+            </button>
+
+            {safePlaceErr ? <p className="mt-2 text-sm text-red-600">{safePlaceErr}</p> : null}
+          </div>
+
+          {/* Trusted email */}
+          <div>
+            <label className="block text-sm font-medium text-black">Trusted email</label>
             <input
-              className="mt-1 w-full rounded-xl border px-3 py-2 text-sm"
+              className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-black shadow-sm placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-violet-200"
               placeholder="trustedfriend@email.com"
               value={trustedEmail}
               onChange={(e) => setTrustedEmail(e.target.value)}
             />
+            <p className="mt-2 text-xs text-slate-600">
+              If you go off-route or miss a check-in, we’ll attempt to notify this contact.
+            </p>
           </div>
 
+          {/* Check-in + controls */}
           <div>
-            <label className="text-sm font-medium">Check-in interval</label>
+            <label className="block text-sm font-medium text-black">Check-in interval</label>
             <select
-              className="mt-1 w-full rounded-xl border px-3 py-2 text-sm"
+              className="mt-2 w-full rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm text-black shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
               value={checkInSecs}
               onChange={(e) => setCheckInSecs(Number(e.target.value))}
             >
@@ -1689,156 +1897,243 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
               <option value={300}>Every 5 min</option>
               <option value={600}>Every 10 min</option>
             </select>
+
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              {!liveActive ? (
+                <button
+                  type="button"
+                  onClick={startLiveWalk}
+                  className="rounded-2xl bg-gradient-to-r from-violet-600 to-sky-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-95"
+                >
+                  Start
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={stopLiveWalk}
+                  className="rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-black shadow-sm hover:bg-slate-50"
+                >
+                  Stop
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={checkInNow}
+                disabled={!liveActive}
+                className="rounded-2xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-black shadow-sm hover:bg-slate-50 disabled:opacity-50"
+              >
+                I’m OK
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-800">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-600">Status</span>
+                <span className="font-semibold text-black">
+                  {!liveActive ? "Not active" : escalated ? "Escalated" : "Active"}
+                </span>
+              </div>
+
+              <div className="mt-2 flex items-center justify-between">
+                <span className="text-slate-600">Next check-in</span>
+                <span className="font-semibold text-black">
+                  {secondsLeft === null ? "—" : `${Math.max(0, secondsLeft)}s`}
+                </span>
+              </div>
+
+              {offRouteMeters !== null && liveActive ? (
+                <div className="mt-2 flex items-center justify-between">
+                  <span className="text-slate-600">Off-route distance</span>
+                  <span className={`font-semibold ${offRoute ? "text-red-600" : "text-black"}`}>
+                    {offRouteMeters}m {offRoute ? "(off route)" : "(on route)"}
+                  </span>
+                </div>
+              ) : null}
+            </div>
           </div>
+        </div>
 
-          <div className="flex items-end gap-2">
-            {!liveActive ? (
-              <button
-                type="button"
-                onClick={startLiveWalk}
-                className="w-full rounded-xl bg-black px-3 py-2 text-sm font-semibold text-white hover:bg-gray-800"
-              >
-                Start Safe Walk
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={stopLiveWalk}
-                className="w-full rounded-xl border px-3 py-2 text-sm font-semibold hover:bg-gray-50"
-              >
-                Stop
-              </button>
-            )}
+        {/* Safe place result */}
+        {safePlace ? (
+          <div className="mt-6 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-black">{safePlace.name}</p>
+                {safePlace.address ? <p className="mt-1 text-sm text-slate-700">{safePlace.address}</p> : null}
+                {typeof safePlace.rating === "number" ? (
+                  <p className="mt-1 text-xs text-slate-600">
+                    Rating: {safePlace.rating}
+                    {typeof safePlace.userRatingsTotal === "number" ? ` (${safePlace.userRatingsTotal})` : ""}
+                  </p>
+                ) : null}
+              </div>
 
-            <button
-              type="button"
-              onClick={checkInNow}
-              disabled={!liveActive}
-              className="w-full rounded-xl border px-3 py-2 text-sm font-semibold disabled:opacity-50 hover:bg-gray-50"
+              <a
+                className="inline-flex items-center justify-center rounded-2xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-slate-800"
+                href={`https://www.google.com/maps/dir/?api=1&destination_place_id=${encodeURIComponent(
+                  safePlace.placeId
+                )}&travelmode=walking`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Open directions
+              </a>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Share link */}
+        {shareToken ? (
+          <div className="mt-4 text-sm text-slate-700">
+            <span className="text-slate-600">Share link: </span>
+            <a
+              className="font-semibold text-violet-700 underline decoration-violet-300 underline-offset-4 hover:text-violet-800"
+              href={`/share/${encodeURIComponent(shareToken)}`}
+              target="_blank"
+              rel="noreferrer"
             >
-              I’m OK
-            </button>
+              Open live safety view
+            </a>
           </div>
-        </div>
-
-        <div className="mt-3 text-sm text-gray-700">
-          <p>
-            Status:{" "}
-            <b>{!liveActive ? "Not active" : escalated ? "Escalated (email sent/attempted)" : "Active"}</b>
-          </p>
-
-          <p>
-            Next check-in: <b>{secondsLeft === null ? "—" : `${Math.max(0, secondsLeft)}s`}</b>
-          </p>
-
-          {offRouteMeters !== null && liveActive ? (
-            <p className={offRoute ? "text-red-600" : ""}>
-              Off-route distance: <b>{offRouteMeters}m</b> {offRoute ? "(off route)" : "(on route)"}
-            </p>
-          ) : null}
-        </div>
+        ) : null}
       </div>
 
-      {/* Status + reset */}
+      {/* Status (loading/errors) */}
       <div className="mt-3 flex items-center justify-between gap-3">
-        <div className="text-sm text-gray-600">
+        <div className="text-sm text-slate-700">
           {loading ? "Scoring routes…" : null}
           {!loading && errorMsg ? <span className="text-red-600">{errorMsg}</span> : null}
         </div>
-
-        <button onClick={resetAll} className="rounded-xl border px-3 py-2 text-sm hover:bg-gray-50">
-          Reset
-        </button>
       </div>
 
       {/* Route cards */}
       <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-        <div className="rounded-2xl border p-4">
+        {/* Fastest */}
+        <div className="rounded-3xl border border-blue-200 bg-white/85 p-6 shadow-sm backdrop-blur">
           <div className="flex items-center justify-between">
-            <h2 className="font-semibold">Fastest Route</h2>
-            <span className="text-xs text-gray-500">Blue</span>
+            <h2 className="text-base font-semibold text-slate-950">Fastest Route</h2>
+            <span className="rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">
+              Fastest
+            </span>
           </div>
 
-          <div className="mt-3 space-y-1 text-sm text-gray-700">
-            <p>
-              ETA: <b>{fastEtaMin ?? "—"}</b> min
-            </p>
-            <p>
-              Distance: <b>{fastDistMi ?? "—"}</b> mi
-            </p>
-            <p>
-              Safety score: <b>{fastSafety ?? "—"}</b> / 100
-            </p>
+          <div className="mt-4 space-y-2 text-sm text-slate-800">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">ETA</span>
+              <span className="font-semibold text-slate-950">{fastEtaMin ?? "—"} min</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">Distance</span>
+              <span className="font-semibold text-slate-950">{fastDistMi ?? "—"} mi</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">Safety score</span>
+              <span className="font-semibold text-slate-950">{fastSafety ?? "—"} / 100</span>
+            </div>
           </div>
+
+          {agentChosenId !== null && fastestId !== null && agentChosenId !== fastestId && (
+            <button
+              onClick={() => sendAgentFeedback(fastestId)}
+              className="mt-5 w-full rounded-2xl border border-blue-200 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700 shadow-sm hover:bg-blue-100"
+            >
+              Choose Fastest Instead
+            </button>
+          )}
         </div>
 
-        {agentChosenId !== null && fastestId !== null && agentChosenId !== fastestId && (
-          <button
-            onClick={() => sendAgentFeedback(fastestId)}
-            className="mt-3 w-full rounded-xl border px-3 py-2 text-sm font-semibold hover:bg-gray-50"
-          >
-            Choose Fastest Instead
-          </button>
-        )}
-
-        <div className="rounded-2xl border p-4">
+        {/* Safer */}
+        <div className="rounded-3xl border border-green-200 bg-white/85 p-6 shadow-sm backdrop-blur">
           <div className="flex items-center justify-between">
-            <h2 className="font-semibold">Safer Route</h2>
-            <span className="text-xs text-gray-500">Green</span>
+            <h2 className="text-base font-semibold text-slate-950">Safer Route</h2>
+            <span className="rounded-full border border-green-200 bg-green-50 px-3 py-1 text-xs font-semibold text-green-700">
+              Recommended
+            </span>
           </div>
 
-          <div className="mt-3 space-y-1 text-sm text-gray-700">
-            <p>
-              ETA: <b>{safeEtaMin ?? "—"}</b> min
-            </p>
-            <p>
-              Distance: <b>{safeDistMi ?? "—"}</b> mi
-            </p>
-            <p>
-              Safety score: <b>{safeSafety ?? "—"}</b> / 100
-            </p>
-            {agentConfidence !== null ? (
-              <p>
-                ML confidence: <b>{agentConfidence}%</b>
-              </p>
-            ) : null}
-
-            <div className="mt-3 rounded-xl bg-gray-50 p-3 text-sm text-gray-700">
-              <p className="font-medium">Why this route</p>
-              <p className="mt-1 text-sm">{safeReason || "Pick a start and end point to see an explanation."}</p>
+          <div className="mt-4 space-y-2 text-sm text-slate-800">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">ETA</span>
+              <span className="font-semibold text-slate-950">{safeEtaMin ?? "—"} min</span>
             </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">Distance</span>
+              <span className="font-semibold text-slate-950">{safeDistMi ?? "—"} mi</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">Safety score</span>
+              <span className="font-semibold text-slate-950">{safeSafety ?? "—"} / 100</span>
+            </div>
+          </div>
+
+          {/* ML confidence bar */}
+          {agentConfidence !== null ? (
+            <div className="mt-4">
+              <div className="flex items-center justify-between text-xs text-slate-600">
+                <span>Model confidence</span>
+                <span className="font-semibold text-slate-950">{agentConfidence}%</span>
+              </div>
+              <div className="mt-2 h-2 w-full rounded-full bg-green-100">
+                <div
+                  className="h-2 rounded-full bg-gradient-to-r from-green-400 to-green-600 transition-all duration-500"
+                  style={{ width: `${agentConfidence}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
+
+          {/* Why this route */}
+          <div className="mt-5 rounded-2xl border border-green-100 bg-white p-4 text-sm text-slate-800">
+            <p className="font-semibold text-slate-950">Why this route</p>
+            <p className="mt-1 text-sm text-slate-700">
+              {safeReason || "Pick a start and end point to see an explanation."}
+            </p>
           </div>
         </div>
       </div>
 
-      {/* Tradeoff summary */}
-      <div className="mt-6 rounded-2xl border bg-white p-4 shadow-sm">
-        <h3 className="text-lg font-semibold">Tradeoff Summary</h3>
+      {/* Tradeoff summary (full width) */}
+      <div className="mt-6 rounded-3xl border border-slate-200 bg-white/85 p-6 shadow-sm backdrop-blur">
+        <div className="flex items-center justify-between">
+          <h3 className="text-lg font-semibold text-slate-950">Tradeoff Summary</h3>
+        </div>
 
         {deltaEtaMin === null || deltaDistanceMi === null ? (
-          <p className="mt-2 text-sm text-gray-500">Select start and destination to compare routes.</p>
+          <p className="mt-2 text-sm text-slate-600">Select start and destination to compare routes.</p>
         ) : (
-          <div className="mt-3 space-y-2 text-sm text-gray-700">
+          <div className="mt-4 space-y-3 text-sm text-slate-800">
             <p>
-              Safer route is <b>{deltaEtaMin >= 0 ? `+${deltaEtaMin}` : deltaEtaMin}</b> minutes and{" "}
-              <b>{deltaDistanceMi >= 0 ? `+${deltaDistanceMi}` : deltaDistanceMi}</b> miles compared to fastest.
+              The safer route is{" "}
+              <span className="font-semibold text-slate-950">
+                {deltaEtaMin >= 0 ? `+${deltaEtaMin}` : deltaEtaMin} minutes
+              </span>{" "}
+              and{" "}
+              <span className="font-semibold text-slate-950">
+                {deltaDistanceMi >= 0 ? `+${deltaDistanceMi}` : deltaDistanceMi} miles
+              </span>{" "}
+              compared to the fastest route.
             </p>
 
             <p>
-              Nearby incidents: <b>{safeNearbyCount ?? "—"}</b> (Safer) vs <b>{fastNearbyCount ?? "—"}</b> (Fastest)
+              Nearby incidents:{" "}
+              <span className="font-semibold text-slate-950">{safeNearbyCount ?? "—"}</span> (Safer) vs{" "}
+              <span className="font-semibold text-slate-950">{fastNearbyCount ?? "—"}</span> (Fastest)
               {deltaNearbyPct !== null ? (
                 <>
                   {" "}
-                  → <b>{deltaNearbyPct}% fewer</b> near-route reports.
+                  → <span className="font-semibold text-slate-950">{deltaNearbyPct}% fewer</span> near-route reports.
                 </>
               ) : null}
             </p>
 
-            <p className="text-xs text-gray-500">“Nearby” uses your selected radius and time window.</p>
+            <p className="text-xs text-slate-500">
+              “Nearby” is computed using your selected radius and time window.
+            </p>
           </div>
         )}
       </div>
     </div>
-  );
+  </div>
+);
 }
-

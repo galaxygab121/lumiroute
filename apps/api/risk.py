@@ -390,5 +390,100 @@ def score_route(
     # final safety guard
     if not math.isfinite(risk):
         risk = 0.0
+
     return float(risk), details
+
+def score_route_by_mode(
+    *,
+    path: List[Dict[str, float]],
+    crimes: List[Dict[str, Any]],
+    radius_km: float,
+    now: datetime,
+    window_days: int,
+    weights: Optional[Dict[str, float]] = None,
+    travel_mode: str = "WALKING",
+    transit_stops: Optional[List[Dict[str, float]]] = None,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Mode-aware scoring wrapper.
+
+    WALKING/BICYCLING:
+      - Score along the full polyline (mid-block exposure).
+    DRIVING:
+      - Same as walking but downweighted (less exposure time).
+    TRANSIT:
+      - Mix:
+          (A) stop exposure near stations/stops (dominant)
+          (B) small walking exposure (first/last mile)
+    """
+    weights = weights or {}
+    travel_mode = (travel_mode or "WALKING").upper()
+
+    # base score from the full path (works for walking/biking/driving too)
+    base_risk, base_details = score_route(
+        path=path,
+        crimes=crimes,
+        radius_km=radius_km,
+        now=now,
+        window_days=window_days,
+        weights=weights,
+    )
+
+    # ---- TRANSIT: focus near stops/stations ----
+    if travel_mode == "TRANSIT":
+        stops = transit_stops or []
+
+        # If we have stops, score them as a tiny "path"
+        if len(stops) > 0:
+            stop_risk, stop_details = score_route(
+                path=stops,
+                crimes=crimes,
+                radius_km=radius_km,
+                now=now,
+                window_days=window_days,
+                weights=weights,
+            )
+
+            # Mix weights (tweakable): stops dominate, walking component smaller
+            walk_w = 0.35
+            stops_w = 0.65
+
+            risk = (base_risk * walk_w) + (stop_risk * stops_w)
+
+            details = {
+                "nearby_count": int((base_details.get("nearby_count", 0) or 0) + (stop_details.get("nearby_count", 0) or 0)),
+                "top_categories": (stop_details.get("top_categories") or base_details.get("top_categories") or []),
+                "radius_km": float(radius_km),
+                "window_days": int(window_days),
+                "mode_breakdown": {
+                    "mode": "TRANSIT",
+                    "walk_component": float(base_risk),
+                    "stop_component": float(stop_risk),
+                    "walk_weight": walk_w,
+                    "stop_weight": stops_w,
+                    "stops_count": len(stops),
+                },
+            }
+            return float(risk), details
+
+        # fallback: no stops => just use base
+        base_details["mode_breakdown"] = {"mode": "TRANSIT", "fallback": "no_stops"}
+        return float(base_risk), base_details
+
+    # ---- DRIVING: downweight exposure ----
+    if travel_mode == "DRIVING":
+        risk = base_risk * 0.70
+        base_details["mode_breakdown"] = {"mode": "DRIVING", "weight": 0.70}
+        return float(risk), base_details
+
+    # ---- BICYCLING: slightly higher exposure than walking (optional) ----
+    if travel_mode == "BICYCLING":
+        risk = base_risk * 1.10
+        base_details["mode_breakdown"] = {"mode": "BICYCLING", "weight": 1.10}
+        return float(risk), base_details
+
+    # ---- WALKING (default) ----
+    base_details["mode_breakdown"] = {"mode": "WALKING", "weight": 1.0}
+    return float(base_risk), base_details
+
     

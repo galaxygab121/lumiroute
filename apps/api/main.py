@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 import os
 
 from pydantic import BaseModel
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 
 import risk
 from agent_route import RouteSafetyAgent
@@ -29,7 +29,7 @@ BASE_DIR = Path(__file__).parent
 
 AGENT_MODEL_PATH = str(BASE_DIR / "models" / "route_agent.joblib")
 AGENT_LOG_PATH = str(BASE_DIR / "data" / "agent_events.jsonl")
-
+TravelMode = Literal["WALKING", "BICYCLING", "DRIVING", "TRANSIT"]
 
 route_agent = RouteSafetyAgent(
     model_path=AGENT_MODEL_PATH,
@@ -60,29 +60,6 @@ app.add_middleware(
 # ---------------------------
 # Models
 # ---------------------------
-
-class LatLng(BaseModel):
-    lat: float
-    lng: float
-
-
-class RoutePayload(BaseModel):
-    id: int
-    path: List[LatLng]
-
-
-class Preferences(BaseModel):
-    # Option 4 controls
-    radius_km: float = 0.75
-    window_days: int = 90
-    weights: Dict[str, float] = {}
-
-
-class ScoreRequest(BaseModel):
-    datetime_iso: str
-    routes: List[RoutePayload]
-    preferences: Optional[Preferences] = None
-
 
 class HeatRequest(BaseModel):
     datetime_iso: str
@@ -144,6 +121,52 @@ class AgentFeedbackReq(BaseModel):
     felt_safe: Optional[bool] = None
     notes: Optional[str] = None
 
+class LatLng(BaseModel):
+    lat: float
+    lng: float
+
+class RouteMeta(BaseModel):
+    sample_points: Optional[List[LatLng]] = None
+    transit_stops: Optional[List[LatLng]] = None
+
+class RouteIn(BaseModel):
+    id: int
+    path: List[LatLng]
+    meta: Optional[RouteMeta] = None
+
+class Preferences(BaseModel):
+    radius_km: float = 0.25
+    window_days: int = 30
+    weights: Dict[str, float] = {}
+
+class RiskScoreContext(BaseModel):
+    travel_mode: Optional[TravelMode] = "WALKING"
+
+class RiskScoreRequest(BaseModel):
+    datetime_iso: str
+    routes: List[RouteIn]
+    preferences: Preferences
+    context: Optional[RiskScoreContext] = None
+
+class TopCategory(BaseModel):
+    category: str
+    count: int
+
+class ScoredRouteDetails(BaseModel):
+    nearby_count: int
+    top_categories: List[TopCategory]
+    radius_km: float
+    window_days: int
+    mode_breakdown: Optional[dict] = None  # helpful for debugging/UX
+
+class ScoredRouteOut(BaseModel):
+    id: int
+    risk_score: float
+    details: ScoredRouteDetails
+
+class RiskScoreResponse(BaseModel):
+    results: List[ScoredRouteOut]
+
 
 # ---------------------------
 # Routes
@@ -154,57 +177,130 @@ def health():
     return {"ok": True}
 
 
-@app.post("/risk/score")
-def risk_score(req: ScoreRequest):
-    """
-    Given multiple route alternatives (each with a polyline decoded into points),
-    compute a risk_score for each route using local CSV crime data.
-    Also returns details for your "agent explanation".
-    """
-
-    # Parse time
+@app.post("/risk/score", response_model=RiskScoreResponse)
+def risk_score(req: RiskScoreRequest):
     now = dt.datetime.fromisoformat(req.datetime_iso.replace("Z", "+00:00"))
 
-    # Preferences (Option 4)
     prefs = req.preferences or Preferences()
     radius_km = float(prefs.radius_km)
     window_days = int(prefs.window_days)
     weights = dict(prefs.weights or {})
 
+    travel_mode: str = "WALKING"
+    if req.context and req.context.travel_mode:
+        travel_mode = req.context.travel_mode
+
     start_time = now - dt.timedelta(days=window_days)
     end_time = now
 
-    # Build a single bounding box around ALL routes (faster than per-route filtering)
-    lats = [p.lat for r in req.routes for p in r.path]
-    lngs = [p.lng for r in req.routes for p in r.path]
+    # --- Build one bbox around everything (routes + meta points) ---
+    lats: List[float] = []
+    lngs: List[float] = []
 
-    # Simple padding so we don't miss crimes slightly off the line
+    for r in req.routes:
+        for p in r.path:
+            lats.append(p.lat)
+            lngs.append(p.lng)
+
+        if r.meta and r.meta.sample_points:
+            for p in r.meta.sample_points:
+                lats.append(p.lat)
+                lngs.append(p.lng)
+
+        if r.meta and r.meta.transit_stops:
+            for p in r.meta.transit_stops:
+                lats.append(p.lat)
+                lngs.append(p.lng)
+
+    if not lats or not lngs:
+        return {"results": []}
+
     pad = 0.01
     min_lat, max_lat = min(lats) - pad, max(lats) + pad
     min_lng, max_lng = min(lngs) - pad, max(lngs) + pad
 
     crimes = filter_crimes_in_box(min_lat, min_lng, max_lat, max_lng, start_time, end_time)
 
-    results = []
+    results: List[Dict[str, Any]] = []
+
     for r in req.routes:
         path = [{"lat": p.lat, "lng": p.lng} for p in r.path]
 
-        score, details = score_route(
-            path,
-            crimes,
-            radius_km=radius_km,
-            now=now,
-            window_days=window_days,
-            weights=weights,
-        )
+        # IMPORTANT: for TRANSIT we want to score more heavily near stops
+        if travel_mode == "TRANSIT" and r.meta and r.meta.transit_stops and len(r.meta.transit_stops) > 0:
+            # 1) score walking-ish component using your existing score_route on the polyline
+            base_score, base_details = score_route(
+                path,
+                crimes,
+                radius_km=radius_km,
+                now=now,
+                window_days=window_days,
+                weights=weights,
+            )
 
-        results.append({
-            "id": r.id,
-            "risk_score": score,
-            "details": details,
-        })
+            # 2) score stop component by treating stops as a tiny "path"
+            stops_path = [{"lat": p.lat, "lng": p.lng} for p in (r.meta.transit_stops or [])]
+            stop_score, stop_details = score_route(
+                stops_path,
+                crimes,
+                radius_km=radius_km,
+                now=now,
+                window_days=window_days,
+                weights=weights,
+            )
 
-    return {"results": results, "crime_points_used": len(crimes)}
+            # 3) combine with weights (tweakable)
+            walk_w = 0.35
+            stops_w = 0.65
+            score = (base_score * walk_w) + (stop_score * stops_w)
+
+            # merge details for UI
+            details = {
+                "nearby_count": int((base_details.get("nearby_count", 0) or 0) + (stop_details.get("nearby_count", 0) or 0)),
+                "top_categories": (stop_details.get("top_categories") or base_details.get("top_categories") or []),
+                "radius_km": base_details.get("radius_km", radius_km),
+                "window_days": base_details.get("window_days", window_days),
+                "mode_breakdown": {
+                    "walk_component": base_score,
+                    "stop_component": stop_score,
+                    "walk_weight": walk_w,
+                    "stop_weight": stops_w,
+                    "stops_count": len(stops_path),
+                },
+            }
+
+        else:
+            # default behavior (WALKING / DRIVING / BICYCLING)
+            travel_mode = (req.context.travel_mode if req.context and req.context.travel_mode else "WALKING")
+
+            stops = None
+            if r.meta and r.meta.transit_stops:
+                stops = [{"lat": p.lat, "lng": p.lng} for p in r.meta.transit_stops]
+
+            score, details = risk.score_route_by_mode(
+                path=path,
+                crimes=crimes,
+                radius_km=radius_km,
+                now=now,
+                window_days=window_days,
+                weights=weights,
+                travel_mode=travel_mode,
+                transit_stops=stops,
+            )
+
+            # optional: light mode scaling (feel free to remove)
+            if travel_mode == "DRIVING":
+                score = score * 0.70
+                details["mode_breakdown"] = {"weight": 0.70}
+            elif travel_mode == "BICYCLING":
+                score = score * 1.10
+                details["mode_breakdown"] = {"weight": 1.10}
+            else:
+                details["mode_breakdown"] = {"weight": 1.0}
+
+        results.append({"id": r.id, "risk_score": float(score), "details": details})
+
+    return {"results": results}
 
 
 @app.post("/risk/heat")
