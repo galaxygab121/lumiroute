@@ -51,7 +51,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://lumiroute.vercel.app",
-        "https://lumiroute-git-main-galaxygab121.vercel.app",  # optional if you use previews
+        "https://lumiroute.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
