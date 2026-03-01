@@ -409,8 +409,6 @@ function extractTransitStops(route: google.maps.DirectionsRoute): LatLng[] {
 }
 
 
-
-
 /**
  * -----------------------
  * Map overlays
@@ -1155,7 +1153,7 @@ const [safePlaceCategory, setSafePlaceCategory] = useState<SafePlaceCategory>("2
       setErrorMsg(null);
 
       try {
-        // 1) Directions (alternatives with forced via waypoints)
+        
         const service = new google.maps.DirectionsService();
         const viaPts = buildViaCandidates(startLL, endLL);
 
@@ -1618,31 +1616,31 @@ return (
         </div>
 
         {/* Travel Mode */}
-<div className="mb-6">
-  <label className="block text-sm font-medium text-black">Travel mode</label>
+        <div className="mb-6">
+          <label className="block text-sm font-medium text-black">Travel mode</label>
 
-  <div className="mt-2 flex flex-wrap gap-2">
-    {[
-      { label: "Walking", value: "WALKING" },
-      { label: "Transit", value: "TRANSIT" },
-      { label: "Driving", value: "DRIVING" },
-      { label: "Bicycling", value: "BICYCLING" },
-    ].map((mode) => (
-      <button
-        key={mode.value}
-        type="button"
-        onClick={() => setTravelMode(mode.value as TravelMode)}
-        className={`rounded-2xl border px-4 py-2 text-sm font-semibold transition ${
-          travelMode === mode.value
-            ? "border-violet-300 bg-violet-100 text-violet-800"
-            : "border-slate-200 bg-white text-black hover:bg-slate-50"
-        }`}
-      >
-        {mode.label}
-      </button>
-    ))}
-  </div>
-</div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            {[
+              { label: "Walking", value: "WALKING" },
+              { label: "Transit", value: "TRANSIT" },
+              { label: "Driving", value: "DRIVING" },
+              { label: "Bicycling", value: "BICYCLING" },
+            ].map((mode) => (
+              <button
+                key={mode.value}
+                type="button"
+                onClick={() => setTravelMode(mode.value as TravelMode)}
+                className={`rounded-2xl border px-4 py-2 text-sm font-semibold transition ${
+                  travelMode === mode.value
+                    ? "border-violet-300 bg-violet-100 text-violet-800"
+                    : "border-slate-200 bg-white text-black hover:bg-slate-50"
+                }`}
+              >
+                {mode.label}
+              </button>
+            ))}
+          </div>
+        </div>
 
         <div className="mt-6 grid grid-cols-1 gap-6 md:grid-cols-3">
           {/* Radius */}

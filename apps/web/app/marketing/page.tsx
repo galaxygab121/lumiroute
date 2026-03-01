@@ -251,8 +251,8 @@ function Footer() {
             </div>
           </div>
           <p className="mt-4 text-sm leading-6 text-slate-700">
-            Built for demos and hackathons: compare route options, explain why, and enable a lightweight “Live Walk”
-            check-in flow.
+            Built for demonhacks hackathon 2026: compare route options, explain why, and enable a lightweight “Live Walk”
+            easy flow.
           </p>
         </div>
 
@@ -290,7 +290,7 @@ function Footer() {
       <div className="border-t border-slate-200">
         <div className="mx-auto flex max-w-6xl flex-col gap-2 px-6 py-6 text-xs text-slate-600 md:flex-row md:items-center md:justify-between">
           <p>© {new Date().getFullYear()} Lumiroute.</p>
-          <p className="text-slate-500">Built by galaxygab121 • Chicago-first MVP</p>
+          <p className="text-slate-500">Built by G & C • CDM DPU DEMON HACKS 2026</p>
         </div>
       </div>
     </footer>
