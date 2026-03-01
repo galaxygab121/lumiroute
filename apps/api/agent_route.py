@@ -1,17 +1,22 @@
-from __future__ import annotations
+# Route safety agent implementation
+# This module defines a RouteSafetyAgent class that can observe route options, make a safety-based decision using an ML model (if available) or a heuristic fallback, explain its decision, and log events for future learning.
+from __future__ import annotations # for forward references in type hints
 
-import json
-import math
-import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
-from joblib import load as joblib_load
+# Standard library imports
+import json # for JSON serialization
+import math # for math functions like isfinite
+import os # for file system operations
+from dataclasses import dataclass # for simple data classes
+from datetime import datetime, timezone # for timestamps
+from typing import Any, Dict, List, Optional, Tuple # for type annotations
+import numpy as np # for numerical operations
+from joblib import load as joblib_load # for loading ML models
 
 import risk  # risk.py
 
+#-----------------------
+# Config and constants
+#-----------------------
 DEFAULT_CATEGORY_VOCAB = [
     "HOMICIDE",
     "CRIMINAL SEXUAL ASSAULT",
@@ -28,7 +33,9 @@ DEFAULT_CATEGORY_VOCAB = [
     "DECEPTIVE PRACTICE",
 ]
 
-
+#-----------------------
+# Agent decision data structure
+#-----------------------
 @dataclass
 class AgentDecision:
     chosen_id: int
@@ -36,7 +43,9 @@ class AgentDecision:
     explanation: str
     explanation_factors: List[Dict[str, Any]]  # faithful factors
 
-
+#-----------------------
+# Utility functions
+#-----------------------
 def _finite(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)
@@ -47,6 +56,7 @@ def _finite(x: Any, default: float = 0.0) -> float:
     return float(v)
 
 
+# Stable teacher proxy for fallback decisions and explanations.
 def _teacher_proxy(fd: Dict[str, float]) -> float:
     """
     Stable risk-like proxy objective (lower = safer).
@@ -60,7 +70,9 @@ def _teacher_proxy(fd: Dict[str, float]) -> float:
     y = (1.0 * nearby_per_km) + (2.5 * high_sev) + (0.15 * is_late) + (0.03 * length)
     return _finite(y, 0.0)
 
-
+#-----------------------
+# Main agent class
+#-----------------------
 class RouteSafetyAgent:
     """
     Fully functional agent (works even without an ML model file):
@@ -69,7 +81,7 @@ class RouteSafetyAgent:
       explain(ML contributions if possible; else proxy-based explanation)
       learn(log for retrain)
     """
-
+    # Initialization with paths for model and logs
     def __init__(self, model_path: str, log_path: str):
         self.model_path = model_path
         self.log_path = log_path
@@ -210,7 +222,7 @@ class RouteSafetyAgent:
         if model is None:
             c = feat_dicts[chosen_idx]
             a = feat_dicts[alt_idx]
-
+            # meaningful factors = features where alt is worse than chosen, with values
             def diff(k: str) -> Dict[str, Any]:
                 return {
                     "feature": k,
@@ -218,7 +230,7 @@ class RouteSafetyAgent:
                     "chosen_value": _finite(c.get(k, 0.0)),
                     "alt_value": _finite(a.get(k, 0.0)),
                 }
-
+            # pick top 5 factors where alt is worse than chosen (positive alt_minus_chosen)
             factors = [
                 diff("nearby_per_km"),
                 diff("high_severity_total"),
@@ -226,7 +238,7 @@ class RouteSafetyAgent:
                 diff("route_length_km"),
                 diff("is_late"),
             ]
-
+            # sort by how much alt is worse than chosen
             explanation = (
                 "I chose this route because it scores lower on my safety objective under your settings "
                 "(fewer nearby incidents per km, fewer high-severity incidents, and reasonable detour length). "
@@ -264,7 +276,7 @@ class RouteSafetyAgent:
 
         # top positive deltas explain why chosen is safer than alt
         top_j = np.argsort(delta)[::-1][:6]
-
+        # build explanation factors for top features
         factors: List[Dict[str, Any]] = []
         for j in top_j:
             name = feature_order[int(j)]
@@ -276,7 +288,7 @@ class RouteSafetyAgent:
                     "alt_value": float(_finite(feat_dicts[alt_idx].get(name, 0.0))),
                 }
             )
-
+        # human-friendly feature names for top factors
         def pretty(f: str) -> str:
             if f == "nearby_per_km":
                 return "fewer nearby incidents per km"
@@ -291,11 +303,11 @@ class RouteSafetyAgent:
             if f == "route_length_km":
                 return "a shorter detour"
             return f.replace("_", " ")
-
+        # pick top 3 bullets for explanation text
         bullets = [pretty(fx["feature"]) for fx in factors[:3] if "feature" in fx]
         while len(bullets) < 3:
             bullets.append("lower overall risk features")
-
+        # build explanation text with top bullets
         explanation = (
             "I chose this route because the ML safety model predicts lower risk given your settings. "
             f"The biggest drivers were {bullets[0]}, {bullets[1]}, and {bullets[2]} compared to the next-best option. "

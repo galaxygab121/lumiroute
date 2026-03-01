@@ -1,44 +1,52 @@
-import datetime as dt
+# Lumiroute API
+# FastAPI server for route risk scoring, heatmaps, and safety agent decisions.
+# Provides endpoints for:
+# - Scoring routes based on nearby crime data and user preferences
+# - Returning heatmap data for crime density in a given area
+# - A safety agent that chooses between route options and learns from feedback
+# - A simple walk check-in system for safety monitoring (demo purpose)
 
-from fastapi.responses import JSONResponse
+import datetime as dt # for handling date and time
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timezone
-from fastapi.responses import JSONResponse
-import os
+from fastapi.responses import JSONResponse # for returning JSON responses with custom status codes
 
-from pydantic import BaseModel
-from typing import Any, Dict, List, Optional, Literal
+from fastapi import FastAPI # main FastAPI class to create the app
+from fastapi.middleware.cors import CORSMiddleware # for handling Cross-Origin Resource Sharing (CORS)
+from datetime import datetime, timezone # for timestamps and timezone handling
+from fastapi.responses import JSONResponse  # for returning JSON responses with custom status codes
 
-import risk
-from agent_route import RouteSafetyAgent
+from pydantic import BaseModel # for defining request and response models with validation
+from typing import Any, Dict, List, Optional, Literal # for type annotations
 
-from risk import filter_crimes_in_box, score_route
-from mailer import send_email
+import risk # custom module for crime data and risk scoring
+from agent_route import RouteSafetyAgent # custom agent for route decision-making
 
-import secrets
-from typing import Dict, Any, Optional
+from risk import filter_crimes_in_box, score_route  # custom functions for filtering crimes and scoring routes
+from mailer import send_email # custom function for sending emails via Resend API
 
-from pathlib import Path
+import secrets # for generating secure tokens for walk sessions
+from typing import Dict, Any, Optional # for type annotations
+
+from pathlib import Path # for handling file paths
+
 
 app = FastAPI()
 WALKS: Dict[str, Dict[str, Any]] = {}
 
 BASE_DIR = Path(__file__).parent
-
+# Allow env vars to override defaults (already used this pattern in mailer)
 AGENT_MODEL_PATH = str(BASE_DIR / "models" / "route_agent.joblib")
 AGENT_LOG_PATH = str(BASE_DIR / "data" / "agent_events.jsonl")
 TravelMode = Literal["WALKING", "BICYCLING", "DRIVING", "TRANSIT"]
-
+# Initialize the RouteSafetyAgent with paths for the model and logs
 route_agent = RouteSafetyAgent(
     model_path=AGENT_MODEL_PATH,
     log_path=AGENT_LOG_PATH,
 )
-
+# Log the paths being used (helpful for debugging and ensuring env vars are picked up)
 print("[Lumiroute] RouteSafetyAgent model:", AGENT_MODEL_PATH)
 print("[Lumiroute] RouteSafetyAgent log:", AGENT_LOG_PATH)
-
+# The RouteSafetyAgent will use these paths to load its ML model and to log decisions and feedback for future learning.
 route_agent = RouteSafetyAgent(
     model_path=str(Path(__file__).parent / "models" / "route_agent.joblib"),
     log_path=str(Path(__file__).parent / "data" / "agent_events.jsonl"),

@@ -1,7 +1,8 @@
-import os
-import resend
+# Email sender via Resend API.
+import os  # for env vars
+import resend # Resend API client
 
-
+# helper to ensure we don't send NaN or inf values in explanations, which can break the UI
 def send_email(to_email: str, subject: str, body: str) -> None:
     """
     Email sender via Resend API.
